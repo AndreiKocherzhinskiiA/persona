@@ -22,6 +22,12 @@ Run this in the repo root:
 docker compose up -d
 ```
 
+Shutdown the docker with:
+
+```bash
+docker compose down
+```
+
 Then open n8n at:
 
 ```text
