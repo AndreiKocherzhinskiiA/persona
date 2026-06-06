@@ -1,0 +1,676 @@
+{
+  "name": "Persona - AI News Aggregator",
+  "nodes": [
+    {
+      "parameters": {
+        "public": true,
+        "initialMessages": "Welcome to Persona — your personalised tech-news aggregator.\nType `help` to see all commands, or `register <email> <password>` to begin.",
+        "options": {
+          "responseMode": "lastNode"
+        }
+      },
+      "id": "7b5ecadf-e7dd-4054-bad1-e2c29104421a",
+      "name": "Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -288,
+        0
+      ],
+      "webhookId": "persona-chat"
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\nconst dir = path.join(os.homedir(), '.n8n', 'persona');\nconst file = path.join(dir, 'users.json');\nconst seed = '{\\n  \"users\": {},\\n  \"sessions\": {},\\n  \"rateLimit\": {}\\n}';\nfs.mkdirSync(dir, { recursive: true });\nlet content = seed;\ntry {\n  const r = fs.readFileSync(file, 'utf-8');\n  if (r && r.trim()) content = r; else fs.writeFileSync(file, seed);\n} catch (e) {\n  try { fs.writeFileSync(file, seed); } catch (_) {}\n}\n\nconst j = $input.first().json || {};\nreturn [{\n  json: j,\n  binary: { data: { data: Buffer.from(content, 'utf-8').toString('base64'), mimeType: 'application/json', fileName: 'users.json' } }\n}];"
+      },
+      "id": "3b975580-4333-4d38-97ed-38e9d108c467",
+      "name": "Read Users (chat)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\n\nconst SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;\nconst MAX_FAIL_PER_HOUR = 5;\nconst PASSWORD_MIN_LEN = 8;\nconst EMAIL_RE = /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/;\nconst TIME_RE = /^([01]?\\d|2[0-3]):([0-5]\\d)$/;\n\nfunction hash(pw, salt) {\n  return crypto.scryptSync(pw, salt, 64).toString('hex');\n}\nfunction newSalt() { return crypto.randomBytes(16).toString('hex'); }\nfunction newToken() { return crypto.randomBytes(24).toString('hex'); }\nfunction now() { return Date.now(); }\n\nlet users = { users: {}, sessions: {}, rateLimit: {} };\ntry {\n  const bin = $input.first().binary && $input.first().binary.data;\n  if (bin) {\n    const buf = Buffer.from(bin.data, 'base64');\n    const parsed = JSON.parse(buf.toString('utf-8'));\n    if (parsed && typeof parsed === 'object') users = Object.assign(users, parsed);\n  }\n} catch (e) {  }\n\nusers.users = users.users || {};\nusers.sessions = users.sessions || {};\nusers.rateLimit = users.rateLimit || {};\n\nconst itemJson = $input.first().json || {};\nconst rawMsg = (itemJson.chatInput || itemJson.message || itemJson.input || '').toString().trim();\nconst sessionId = (itemJson.sessionId || itemJson.session_id || 'anon').toString();\n\nconst clientKey = sessionId;\nconst rl = users.rateLimit[clientKey] || { count: 0, windowStart: now() };\nif (now() - rl.windowStart > 60 * 60 * 1000) { rl.count = 0; rl.windowStart = now(); }\n\nfunction reject(msg) {\n  users.rateLimit[clientKey] = rl;\n  return { response: msg, users, shouldWrite: true };\n}\nfunction ok(msg, write = true) {\n  users.rateLimit[clientKey] = rl;\n  return { response: msg, users, shouldWrite: write };\n}\n\nif (!rawMsg) return [{ json: ok('Empty message. Type `help` for commands.', false) }];\nif (rawMsg.length > 2000) return [{ json: reject('Message too long. Reject.') }];\n\nfunction getActiveUser() {\n  const s = users.sessions[sessionId];\n  if (!s) return null;\n  if (now() > s.expires) { delete users.sessions[sessionId]; return null; }\n  return users.users[s.email] ? s.email : null;\n}\n\nconst parts = rawMsg.split(/\\s+/);\nconst cmd = parts[0].toLowerCase();\nconst rest = rawMsg.slice(parts[0].length).trim();\n\nfunction bumpFail() {\n  rl.count = (rl.count || 0) + 1;\n  if (rl.count > MAX_FAIL_PER_HOUR) {\n    return 'Too many failed attempts. Try again in 1 hour.';\n  }\n  return null;\n}\n\nif (cmd === 'help' || cmd === '?') {\n  return [{ json: ok([\n    'Persona commands:',\n    '  register <email> <password>',\n    '  login <email> <password>',\n    '  logout',\n    '  set interests <topic1, topic2, ...>',\n    '     tech sub-categories: ai, frontend, security, gamedev, devops, startups, hardware',\n    '     (general topics work too: world, science, business)',\n    '  set schedule <HH:MM>',\n    '  set email <new-email>',\n    '  status',\n    '  newsletter now',\n    '  unsubscribe',\n    '',\n    'Privacy: your email is stored only to send newsletters. Use `unsubscribe` to erase.'\n  ].join('\\n'), false) }];\n}\n\nif (cmd === 'register') {\n  const m = rest.match(/^(\\S+)\\s+(.+)$/);\n  if (!m) return [{ json: reject('Usage: register <email> <password>') }];\n  const [, email, password] = m;\n  if (!EMAIL_RE.test(email)) return [{ json: reject('Invalid email.') }];\n  if (password.length < PASSWORD_MIN_LEN) return [{ json: reject('Password must be at least 8 characters.') }];\n  const key = email.toLowerCase();\n  if (users.users[key]) return [{ json: reject('An account with that email already exists.') }];\n  const salt = newSalt();\n  users.users[key] = {\n    email: key,\n    salt,\n    passwordHash: hash(password, salt),\n    interests: [],\n    schedule: null,\n    role: 'user',\n    createdAt: now(),\n    lastSent: 0,\n    consent: { storeEmail: true, sendNewsletter: true, consentedAt: now() }\n  };\n  const token = newToken();\n  users.sessions[sessionId] = { email: key, token, expires: now() + SESSION_TTL_MS };\n  return [{ json: ok(`Registered ${email}. You are logged in.\\nNext: \\`set interests ai, climate\\` and \\`set schedule 08:00\\`.`) }];\n}\n\nif (cmd === 'login') {\n  const m = rest.match(/^(\\S+)\\s+(.+)$/);\n  if (!m) return [{ json: reject('Usage: login <email> <password>') }];\n  const [, email, password] = m;\n  const key = email.toLowerCase();\n  const u = users.users[key];\n  const fail = () => {\n    const block = bumpFail();\n    return [{ json: reject(block || 'Invalid credentials.') }];\n  };\n  if (!u) return fail();\n  const candidate = hash(password, u.salt);\n  if (candidate !== u.passwordHash) return fail();\n  const token = newToken();\n  users.sessions[sessionId] = { email: key, token, expires: now() + SESSION_TTL_MS };\n  return [{ json: ok(`Logged in as ${key}.`) }];\n}\n\nconst activeEmail = getActiveUser();\nif (!activeEmail) {\n  return [{ json: reject('Not authenticated. Use `register` or `login` first.') }];\n}\nconst user = users.users[activeEmail];\n\nif (cmd === 'logout') {\n  delete users.sessions[sessionId];\n  return [{ json: ok('Logged out.') }];\n}\n\nif (cmd === 'status') {\n  return [{ json: ok([\n    `Email:     ${user.email}`,\n    `Interests: ${user.interests.length ? user.interests.join(', ') : '(none set)'}`,\n    `Schedule:  ${user.schedule || '(none set)'}`,\n    `Last sent: ${user.lastSent ? new Date(user.lastSent).toISOString() : 'never'}`\n  ].join('\\n'), false) }];\n}\n\nif (cmd === 'set') {\n  const subParts = rest.split(/\\s+/);\n  const sub = (subParts[0] || '').toLowerCase();\n  const subRest = rest.slice(sub.length).trim();\n  if (sub === 'interests') {\n    if (!subRest) return [{ json: reject('Usage: set interests <topic1, topic2, ...>') }];\n    const list = subRest.split(/[,;]+/).map(s => s.trim().toLowerCase()).filter(Boolean).slice(0, 20);\n    user.interests = list;\n    return [{ json: ok(`Interests updated: ${list.join(', ')}`) }];\n  }\n  if (sub === 'schedule') {\n    if (!TIME_RE.test(subRest)) return [{ json: reject('Usage: set schedule <HH:MM> (24h, UTC)') }];\n    user.schedule = subRest;\n    return [{ json: ok(`Schedule set to ${subRest} UTC daily.`) }];\n  }\n  if (sub === 'email') {\n    if (!EMAIL_RE.test(subRest)) return [{ json: reject('Invalid email.') }];\n    const newKey = subRest.toLowerCase();\n    if (users.users[newKey] && newKey !== user.email) return [{ json: reject('Email already in use.') }];\n    delete users.users[user.email];\n    user.email = newKey;\n    users.users[newKey] = user;\n    users.sessions[sessionId].email = newKey;\n    return [{ json: ok(`Email updated to ${newKey}.`) }];\n  }\n  return [{ json: reject('Unknown `set` subcommand. Try: set interests | set schedule | set email') }];\n}\n\nif (cmd === 'unsubscribe') {\n  delete users.users[activeEmail];\n  delete users.sessions[sessionId];\n  return [{ json: ok('Account deleted. All personal data erased. Goodbye.') }];\n}\n\nif (cmd === 'newsletter') {\n  if ((rest || '').toLowerCase() === 'now') {\n    user._forceSend = true;\n    return [{ json: ok('A newsletter will be queued on the next scheduled tick (within 1 hour). Use `set schedule` for daily delivery.') }];\n  }\n  return [{ json: reject('Usage: newsletter now') }];\n}\n\nreturn [{ json: reject('Unknown command. Type `help`.') }];\n"
+      },
+      "id": "dfc43fbb-dd8f-4dfb-90eb-49acf1d04d80",
+      "name": "Chat Core Logic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        160,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\nconst personaDir = path.join(os.homedir(), '.n8n', 'persona');\nfs.mkdirSync(personaDir, { recursive: true });\n\nconst j = $input.first().json;\nconst payload = JSON.stringify(j.users, null, 2);\nreturn [{\n  json: { response: j.response, shouldWrite: !!j.shouldWrite },\n  binary: {\n    data: {\n      data: Buffer.from(payload, 'utf-8').toString('base64'),\n      mimeType: 'application/json',\n      fileName: 'users.json'\n    }\n  }\n}];"
+      },
+      "id": "5956fe2c-671e-48d1-96bf-552cd4225bc9",
+      "name": "Serialize Users",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        384,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\nconst dir = path.join(os.homedir(), '.n8n', 'persona');\nconst file = path.join(dir, 'users.json');\nfs.mkdirSync(dir, { recursive: true });\nconst item = $input.first();\nif (item.json && item.json.shouldWrite && item.binary && item.binary.data) {\n  fs.writeFileSync(file, Buffer.from(item.binary.data.data, 'base64'));\n}\nreturn [{ json: item.json }];"
+      },
+      "id": "e317c483-9246-45b2-b172-15a570615469",
+      "name": "Write Users (chat)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { output: $input.first().json.response } }];"
+      },
+      "id": "263b87f1-4db4-4b1d-9738-2a8c00d05cd4",
+      "name": "Respond",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "id": "84d38b1d-ae50-4cca-b479-426924e5944b",
+      "name": "Hourly Tick",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -288,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\nconst dir = path.join(os.homedir(), '.n8n', 'persona');\nconst file = path.join(dir, 'users.json');\nconst seed = '{\\n  \"users\": {},\\n  \"sessions\": {},\\n  \"rateLimit\": {}\\n}';\nfs.mkdirSync(dir, { recursive: true });\nlet content = seed;\ntry {\n  const r = fs.readFileSync(file, 'utf-8');\n  if (r && r.trim()) content = r; else fs.writeFileSync(file, seed);\n} catch (e) {\n  try { fs.writeFileSync(file, seed); } catch (_) {}\n}\nreturn [{\n  json: {},\n  binary: { data: { data: Buffer.from(content, 'utf-8').toString('base64'), mimeType: 'application/json', fileName: 'users.json' } }\n}];"
+      },
+      "id": "4553ef53-2caf-4392-8266-ca83b639d9a1",
+      "name": "Read Users (cron)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        512
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "let store = { users: {}, sessions: {}, rateLimit: {} };\ntry {\n  const bin = $input.first().binary && $input.first().binary.data;\n  if (bin) store = Object.assign(store, JSON.parse(Buffer.from(bin.data, 'base64').toString('utf-8')));\n} catch(e) {}\n\nconst d = new Date();\nconst hh = d.getUTCHours().toString().padStart(2,'0');\nconst dayKey = d.toISOString().slice(0,10);\n\nconst due = [];\nfor (const [email, u] of Object.entries(store.users)) {\n  if (!u.consent || !u.consent.sendNewsletter) continue;\n  if (!u.interests || u.interests.length === 0) continue;\n  const force = !!u._forceSend;\n  const scheduled = u.schedule && u.schedule.startsWith(hh + ':');\n  if (!force && !scheduled) continue;\n  const lastDay = u.lastSent ? new Date(u.lastSent).toISOString().slice(0,10) : null;\n  if (lastDay === dayKey && !force) continue;\n  due.push({ email, interests: u.interests });\n}\n\nif (due.length === 0) {\n\n  return [{ json: { _store: store, _empty: true } }];\n}\n\nreturn due.map(u => ({ json: { email: u.email, interests: u.interests, _store: store } }));"
+      },
+      "id": "1fd576db-58a3-4b95-bfc9-57ac1a24ba70",
+      "name": "Find Due Users",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        160,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://hnrss.org/frontpage",
+        "options": {}
+      },
+      "id": "a0eb8720-ac16-42de-9459-449aa6d51762",
+      "name": "RSS: Hacker News",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        832,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://feeds.bbci.co.uk/news/world/rss.xml",
+        "options": {}
+      },
+      "id": "160d544c-5d7d-4b0d-afb8-f6331daf404d",
+      "name": "RSS: BBC World",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        832,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://feeds.arstechnica.com/arstechnica/index",
+        "options": {}
+      },
+      "id": "864f8154-c478-4f3d-9f28-9cdaa05d63ab",
+      "name": "RSS: Ars Technica",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        832,
+        608
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.theverge.com/rss/index.xml",
+        "options": {}
+      },
+      "id": "cc527379-42c1-4bd2-8cc9-fcd6324d175f",
+      "name": "RSS: The Verge",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.2,
+      "position": [
+        832,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "id": "087149b1-a0b1-4bf7-bd07-1097114f9287",
+      "name": "Merge Feeds",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [
+        1056,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst staticData = $getWorkflowStaticData('global');\nconst due = items.map(i => ({ email: i.json.email, interests: i.json.interests }));\nstaticData.due = due;\nstaticData.store = items[0] && items[0].json && items[0].json._store ? items[0].json._store : { users: {} };\nreturn items;"
+      },
+      "id": "9e65a349-8e67-48c6-80c1-57b5a0af40c2",
+      "name": "Stash Due Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "A&A Devs <marketing@a-a-devs.com>",
+        "toEmail": "={{$json.email}}",
+        "subject": "={{$json.subject}}",
+        "html": "={{$json.html}}",
+        "options": {}
+      },
+      "id": "e64b81c8-24cd-4cf5-a623-84356ce924c2",
+      "name": "Send Newsletter",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2752,
+        512
+      ],
+      "webhookId": "4d76e497-31bf-454d-902b-8a764d6e9343",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\nconst personaDir = path.join(os.homedir(), '.n8n', 'persona');\nfs.mkdirSync(personaDir, { recursive: true });\n\nconst staticData = $getWorkflowStaticData('global');\nconst store = staticData.store || { users: {} };\nconst sentEmails = [];\nfor (const i of $input.all()) {\n  const acc = i.json && i.json.accepted;\n  if (Array.isArray(acc)) {\n    for (const a of acc) {\n      if (a) {\n        sentEmails.push(a.toString().toLowerCase());\n      }\n    }\n  }\n}\nconst t = Date.now();\nfor (const e of sentEmails) {\n  if (store.users[e]) {\n    store.users[e].lastSent = t;\n    delete store.users[e]._forceSend;\n  }\n}\nstaticData.store = store;\nconst payload = JSON.stringify(store, null, 2);\nreturn [{\n  json: { written: sentEmails.length },\n  binary: {\n    data: {\n      data: Buffer.from(payload, 'utf-8').toString('base64'),\n      mimeType: 'application/json',\n      fileName: 'users.json'\n    }\n  }\n}];"
+      },
+      "id": "43410ebc-f318-4c01-a686-9450644ddebe",
+      "name": "Mark Sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2976,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\nconst dir = path.join(os.homedir(), '.n8n', 'persona');\nconst file = path.join(dir, 'users.json');\nfs.mkdirSync(dir, { recursive: true });\nconst item = $input.first();\nif (item.binary && item.binary.data) {\n  fs.writeFileSync(file, Buffer.from(item.binary.data.data, 'base64'));\n}\nreturn [{ json: item.json }];"
+      },
+      "id": "fd4c9b84-3ede-4acf-aa52-c2742c5d1046",
+      "name": "Write Users (cron)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3200,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst due = [];\n\nfor (const item of items) {\n  const data = item.json;\n\n  if (data && data._empty !== true && data.email) {\n    due.push(item);\n  }\n}\n\nreturn due;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        384,
+        512
+      ],
+      "id": "654834fd-03a5-4873-a0bf-f433adcd6ce2",
+      "name": "Is Due or Forced"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst built = [];\n\nfor (const item of items) {\n  const data = item.json;\n\n  if (data && data._nothing !== true && data.email && data.html) {\n    built.push(item);\n  }\n}\n\nreturn built;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2528,
+        512
+      ],
+      "id": "efac6cf8-cb2b-4846-890c-78b4319ac7d4",
+      "name": "Email Built?"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are scoring one news article for one user.\n\nUser interests: {{ $json.interests.join(', ') }}\nArticle title: {{ $json.title }}\nArticle snippet: {{ $json.snippet }}\n\nScore relevance using this scale only:\n0 = unrelated\n1-3 = weak match\n4-6 = relevant\n7-8 = strong match\n9-10 = excellent match\n\nRules:\n- Return only valid JSON.\n- score must be a whole integer.\n- score must be between 0 and 10.\n- reason must be under 12 words.\n\nReturn exactly:\n{\"score\":0,\"reason\":\"short reason\"}",
+        "hasOutputParser": true,
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1504,
+        388
+      ],
+      "id": "52b85cf3-c431-4699-a1d1-b7bb83e2cf05",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": "llama3.2:latest",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmOllama",
+      "typeVersion": 1,
+      "position": [
+        1576,
+        612
+      ],
+      "id": "e929f50e-21ea-4dc2-ba0d-b53c6753be1a",
+      "name": "Ollama Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "4N0ZHRaHpBVhegHl",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const articles = $input.all().map(i => i.json).filter(a => a && (a.title || a.link));\nconst staticData = $getWorkflowStaticData('global');\nconst due = staticData.due || [];\n\nconst out = [];\nfor (const user of due) {\n  for (const article of articles) {\n    out.push({\n      json: {\n        email: user.email,\n        interests: user.interests,\n        title: article.title || '(untitled)',\n        link: article.link || '#',\n        snippet: (article.contentSnippet || article.content || article.description || '').toString().slice(0, 500),\n      }\n    });\n  }\n}\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        512
+      ],
+      "id": "29482f8c-3b4b-447b-ba23-aaf17ce7fe8c",
+      "name": "Expand User Article Pairs"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\n\nlet raw =\n  item.text ??\n  item.output ??\n  item.response?.text ??\n  item.response ??\n  '';\n\nraw = String(raw).trim()\n  .replace(/^```json\\s*/i, '')\n  .replace(/^```\\s*/i, '')\n  .replace(/```$/i, '');\n\nconst start = raw.indexOf('{');\nconst end = raw.lastIndexOf('}');\nif (start !== -1 && end !== -1 && end > start) {\n  raw = raw.slice(start, end + 1);\n}\n\nraw = raw.replace(/\"reason:\\s*/g, '\"reason\":');\n\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  parsed = { score: 0, reason: 'Could not parse model output' };\n}\n\nlet score = Number(parsed.score);\nif (!Number.isFinite(score)) score = 0;\nscore = Math.max(0, Math.min(10, Math.round(score)));\n\nreturn [\n  {\n    json: {\n      email: item.email,\n      interests: Array.isArray(item.interests) ? item.interests : [],\n      title: item.title || '(untitled)',\n      link: item.link || '#',\n      snippet: item.snippet || '',\n      score,\n      reason: parsed.reason || 'No reason returned'\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        512
+      ],
+      "id": "dabb1f1b-4a40-4b7e-8d50-603bd3297695",
+      "name": "Parse LLM Score"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map(i => i.json);\nconst grouped = {};\n\nfor (const item of items) {\n  if (!grouped[item.email]) grouped[item.email] = [];\n  grouped[item.email].push(item);\n}\n\nconst out = [];\n\nfor (const [email, articles] of Object.entries(grouped)) {\n  const ranked = articles\n    .filter(a => a.score >= 4)\n    .sort((a, b) => b.score - a.score)\n    .slice(0, 8);\n\n  if (!ranked.length) continue;\n\n  const interests = ranked[0].interests || [];\n\n  const htmlItems = ranked.map(a => `\n    <li>\n      <a href=\"${a.link}\">${String(a.title).replace(/</g, '&lt;')}</a><br>\n      <small>Score: ${a.score}/10 — ${String(a.reason).replace(/</g, '&lt;')}</small><br>\n      <small>${String(a.snippet).replace(/</g, '&lt;').slice(0, 250)}</small>\n    </li>\n  `).join('');\n\n  out.push({\n    json: {\n      email,\n      subject: `Persona Briefing — ${new Date().toISOString().slice(0, 10)}`,\n      html: `<!doctype html><html><body style=\"font-family:sans-serif;max-width:680px;margin:auto\"><h2>Your Persona Briefing</h2><p>Topics: <em>${interests.join(', ')}</em></p><ul>${htmlItems}</ul><hr><p style=\"font-size:12px;color:#666\">You receive this because you registered with Persona. To stop, send <code>unsubscribe</code> in the Persona chatbot.</p></body></html>`\n    }\n  });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2304,
+        512
+      ],
+      "id": "945548c3-2744-461d-98a6-529deea951e7",
+      "name": "Group Top Articles Per User"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1856,
+        512
+      ],
+      "id": "c22fc1a2-f6d2-448e-be29-77b2cb95078c",
+      "name": "Merge Original"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Users (chat)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Users (chat)": {
+      "main": [
+        [
+          {
+            "node": "Chat Core Logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Core Logic": {
+      "main": [
+        [
+          {
+            "node": "Serialize Users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Serialize Users": {
+      "main": [
+        [
+          {
+            "node": "Write Users (chat)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Users (chat)": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hourly Tick": {
+      "main": [
+        [
+          {
+            "node": "Read Users (cron)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Users (cron)": {
+      "main": [
+        [
+          {
+            "node": "Find Due Users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Due Users": {
+      "main": [
+        [
+          {
+            "node": "Is Due or Forced",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stash Due Context": {
+      "main": [
+        [
+          {
+            "node": "RSS: Hacker News",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "RSS: BBC World",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "RSS: Ars Technica",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "RSS: The Verge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RSS: Hacker News": {
+      "main": [
+        [
+          {
+            "node": "Merge Feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "RSS: BBC World": {
+      "main": [
+        [
+          {
+            "node": "Merge Feeds",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "RSS: Ars Technica": {
+      "main": [
+        [
+          {
+            "node": "Merge Feeds",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "RSS: The Verge": {
+      "main": [
+        [
+          {
+            "node": "Merge Feeds",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Merge Feeds": {
+      "main": [
+        [
+          {
+            "node": "Expand User Article Pairs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Newsletter": {
+      "main": [
+        [
+          {
+            "node": "Mark Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Sent": {
+      "main": [
+        [
+          {
+            "node": "Write Users (cron)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Due or Forced": {
+      "main": [
+        [
+          {
+            "node": "Stash Due Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Built?": {
+      "main": [
+        [
+          {
+            "node": "Send Newsletter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Merge Original",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand User Article Pairs": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Original",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Parse LLM Score": {
+      "main": [
+        [
+          {
+            "node": "Group Top Articles Per User",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group Top Articles Per User": {
+      "main": [
+        [
+          {
+            "node": "Email Built?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Original": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "26bfbd46-453e-4208-ad73-cbb9091b1203",
+  "meta": {
+    "instanceId": "87221cf65edf79d0e769051c2e617347cb63cd2c3583faaf49500b77211413c8"
+  },
+  "id": "gIVBFmRKY0YE9ymo",
+  "tags": []
+}
